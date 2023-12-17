@@ -2,7 +2,28 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+import math
+import os
+from PIL import Image, ImageFilter
+import json
 
+
+#=================================================================
+
+#フォルダー"depth"から深度画像を読み込む
+def read_depth_image(i):
+  #フォルダーのi番目の画像を持ってくる
+  number = str(i).zfill(3)  # 3桁にゼロ埋め
+  image_path = f'/Users/uchimurataichi/SceneFlow/depth_Kallax_Shelf_Drawer/000{number}.png'
+  try:
+      #image = Image.open(image_path)
+      image = cv2.imread(image_path, cv2.IMREAD_ANYDEPTH).astype(np.float32)
+      return image
+  except FileNotFoundError:
+      print(f"File not found: {image_path}")
+      return None
+
+#深度カメラの内部パラメータが記録されたファイル（引数）を読み取り、そのパラメータを返すもの
 def get_depth_ins_params(param_file):
     '''
     read the depth intrinsic parameters file
@@ -25,6 +46,8 @@ def get_depth_ins_params(param_file):
     }
     return ir_camera_params_obj
 
+
+#RGBカメラの内部パラメータが記録されたファイルを読み取り、それらのパラメータを返すもの
 def get_rgb_ins_params(param_file):
     '''
     read the rgb intrinsic parameters file
@@ -67,6 +90,24 @@ def get_rgb_ins_params(param_file):
     }
     return rgb_camera_params_obj
 
+def get_relative_depth(img, min_depth_val=0.0, max_depth_val = 4500, colormap='jet'):
+    '''
+    Convert the depth image to relative depth for better visualization. uses fixed minimum and maximum distances
+    to avoid flickering
+    :param img: depth image
+           min_depth_val: minimum depth in mm (default 50cm)
+           max_depth_val: maximum depth in mm ( default 10m )
+    :return:
+    relative_depth_frame: relative depth converted into cv2 GBR
+    '''
+
+    relative_depth_frame = cv2.convertScaleAbs(img, alpha=(255.0/max_depth_val),
+                                               beta=-255.0*min_depth_val/max_depth_val)
+    relative_depth_frame = cv2.cvtColor(relative_depth_frame, cv2.COLOR_GRAY2BGR)
+    # relative_depth_frame = cv2.applyColorMap(relative_depth_frame, cv2.COLORMAP_JET)
+    return relative_depth_frame
+
+#レンズ歪みの影響を受けた2D画像上の座標（mx, my）を、歪みが補正された座標（x, y）に変換
 def distort(mx, my, depth_ins):
     # see http://en.wikipedia.org/wiki/Distortion_(optics) for description
     # based on the C++ implementation in libfreenect2
@@ -79,8 +120,11 @@ def distort(mx, my, depth_ins):
     kr = 1 + ((depth_ins['k3'] * r2 + depth_ins['k2']) * r2 + depth_ins['k1']) * r2
     x = depth_ins['fx'] * (dx * kr + depth_ins['p2'] * (r2 + 2 * dx2) + depth_ins['p1'] * dxdy2) + depth_ins['cx']
     y = depth_ins['fy'] * (dy * kr + depth_ins['p1'] * (r2 + 2 * dy2) + depth_ins['p2'] * dxdy2) + depth_ins['cy']
-    return x, y
+    #return x, y
+    return int(x), int(y)
 
+
+#深度画像上の座標（mx, my）と対応する深度値（dz）を受け取り、それをカラー画像上の座標に変換
 def depth_to_color(mx, my, dz, depth_ins, color_ins):
     # based on the C++ implementation in libfreenect2, constants are hardcoded into sdk
     depth_q = 0.01
@@ -108,10 +152,12 @@ def depth_to_color(mx, my, dz, depth_ins, color_ins):
     return rx, ry
 
 
-
-def getPointXYZ(undistorted, r, c, depth_ins):
-    depth_val = undistorted[r, c] #/ 1000.0  # map from mm to meters
-    if np.any(np.isnan(depth_val)) or np.any(depth_val <= 0.001):
+# 歪みが補正された深度画像上の特定のピクセル（r, c）に対応する3Dポイント（x, y, z）を取得
+# もし深度値が無効な場合や非常に小さい場合（0.001未満）は、座標を原点に設定
+# それ以外の場合は、指定された内部パラメータを使用して深度座標に変換し、3Dポイントを作成して返す
+def getPointXYZ(depth_val, r, c, depth_ins):
+    #depth_val = undistorted[r, c] #/ 1000.0  # map from mm to meters
+    if (np.isnan(depth_val)) or (depth_val <= 0.001):
         x = 0
         y = 0
         z = 0
@@ -122,156 +168,706 @@ def getPointXYZ(undistorted, r, c, depth_ins):
     point = [x, y, z]
     return point
 
+def flow_vector(flow, spacing, margin, minlength):
+    """Parameters:
+    input
+    flow: motion vectors 3D-array
+    spacing: pixel spacing of the flow
+    margin: pixel margins of the flow
+    minlength: minimum pixels to leave as flow
+    output
+    x: x coord 1D-array
+    y: y coord 1D-array
+    u: x direction flow vector 2D-array
+    v: y direction flow vector 2D-array
+    """
+    h, w, _ = flow.shape
+
+    x = np.arange(margin, w - margin, spacing, dtype=np.int64)
+    y = np.arange(margin, h - margin, spacing, dtype=np.int64)
+
+    mesh_flow = flow[np.ix_(y, x)]
+    mag, _ = cv2.cartToPolar(mesh_flow[..., 0], mesh_flow[..., 1])
+    mesh_flow[mag < minlength] = np.nan  # minlength以下をnanに置換
+
+    u = mesh_flow[..., 0]
+    v = mesh_flow[..., 1]
+
+    return x, y, u, v
+
+def flow_vector1(flow, x, y, z, depth_img2):
+
+    u = flow[y, x, 0]
+    v = flow[y, x, 1]
+    
+    point = getPointXYZ(z, y, x, depth_ins_params)
+    
+    if(int(y+v)>423 or int(x+u)>511):
+        w = 0
+    else:
+        z2 = depth_img2[int(y+v), int(x+u)]
+        w = z2 - z
+
+    x_v = [x]
+    y_v = [y]
+    z_v = [z]
+    x_v2 = [point[0]]
+    y_v2 = [point[1]]
+    z_v2 = [point[2]]
+    u_v = [u]
+    v_v = [v]
+    w_v = [w]
+    
+    
+    return x_v, y_v, z_v, u_v, v_v, w_v, x_v2, y_v2, z_v2
+
+"""
+def flow_vector2(flow, x, y, z, depth_img2, x_v, y_v, z_v, u_v, v_v, w_v):
+    x_v.append(x)
+    y_v.append(y)
+    z_v.append(z)
 
 
+    u = flow[y, x, 0]
+    v = flow[y, x, 1]
+    
+    if(int(y+v)>423 or int(x+u)>511):
+        w = 0
+    else:
+        z2 = depth_img2[int(y+v), int(x+u)]
+        w = z2 - z
 
+    #x_v2 = x_v.extend([x])
+    u_v.append(u)
+    v_v.append(v)
+    w_v.append(w)
+        #print(f"x_v={x_v}, y_v={y_v}")
+
+
+    return x_v, y_v, z_v, u_v, v_v, w_v
+
+"""
+def flow_vector2(flow, x, y, z, depth_img2, x_v, y_v, z_v, u_v, v_v, w_v, x_v2, y_v2, z_v2):
+    point = getPointXYZ(z, y, x, depth_ins_params)
+    
+    x_v.append(x)
+    y_v.append(y)
+    z_v.append(z)
+    x_v2.append(point[0])
+    y_v2.append(point[1])
+    z_v2.append(point[2])
+
+
+    u = flow[y, x, 0]
+    v = flow[y, x, 1]
+    mag = np.sqrt(u**2 + v**2)
+    if(mag >= 0.5):
+        #print(f"2Dベクトルの大きさは{mag}")
+        #print(f"int(y+v)={int(y+v)}, int(x+u)={int(x+u)}")
+        if(int(y+v)>423 or int(x+u)>511):
+            w = 0
+        else:
+            z2 = depth_img2[int(y+v), int(x+u)]
+            w = z2 - z
+        
+        #x_v2 = x_v.extend([x])
+        u_v.append(u)
+        v_v.append(v)
+        w_v.append(w)
+        #print(f"x_v={x_v}, y_v={y_v}")
+    else:
+        u_v.append(0)
+        v_v.append(0)
+        w_v.append(0)
+
+
+    return x_v, y_v, z_v, u_v, v_v, w_v, x_v2, y_v2, z_v2
+#"""
+
+def get_active_person(people, center=(960, 540), min_bbox_area=20000):
+    """
+    Select the active skeleton in the scene by applying a heuristic of findng the closest one to the center of the frame
+    then take it only if its bounding box is large enough - eliminates small bbox like kids
+    Assumes 100 * 200 minimum size of bounding box to consider
+    Parameters
+    ----------
+    data : pose data extracted from json file
+    center: center of image (x, y)
+    min_bbox_area: minimal bounding box area threshold
+
+    Returns
+    -------
+    pose: skeleton of the active person in the scene (flattened)
+    """
+
+    pose = None
+    min_dtc = float('inf')  # dtc = distance to center
+    for person in people:
+        current_pose = person['pose_keypoints_2d']
+        joints_2d = np.reshape(current_pose, (-1, 3))[:, :2]
+        if 'boxes' in person.keys():
+            #maskrcnn
+            bbox = person['boxes']
+        else:
+            # openpose
+            idx = np.where(joints_2d.any(axis=1))[0]
+            bbox = [np.min(joints_2d[idx, 0]),
+                    np.min(joints_2d[idx, 1]),
+                    np.max(joints_2d[idx, 0]),
+                    np.max(joints_2d[idx, 1])]
+
+
+        A = (bbox[2] - bbox[0] ) * (bbox[3] - bbox[1]) #bbox area
+        bbox_center = (bbox[0] + (bbox[2] - bbox[0])/2, bbox[1] + (bbox[3] - bbox[1])/2) #bbox center
+        # joints_2d = np.reshape(current_pose, (-1, 3))
+        # dtc = compute_skeleton_distance_to_center(joints_2d[:, :2], center=center)
+        dtc = np.sqrt(np.sum((np.array(bbox_center) - np.array(center))**2))
+        if dtc < min_dtc :
+            closest_pose = current_pose
+            if A > min_bbox_area:
+                pose = closest_pose
+                min_dtc = dtc
+    # if all bboxes are smaller than threshold, take the closest
+    if pose is None:
+        pose = closest_pose
+    return pose
+
+
+def read_pose_json(json_path, depth_img, color_ins):
+    """
+    Parameters
+    ----------
+    json_path : path to json file
+
+    Returns
+    -------
+    data: a list of dictionaries containing the pose information per video frame
+    """
+    with open(json_path) as json_file:
+        json_data = json.load(json_file)
+    data = json_data['people']
+    if len(data) > 1:
+        data = get_active_person(data)
+    else:
+        data = np.array(data[0]['pose_keypoints_2d'])  # x,y,confidence
+
+    data = np.reshape(data, (-1, 3))
+    #np.savetxt('output.txt', data, delimiter=',')
+    data = data[:, :2]
+    
+    #data[:, 0], data[:, 1] = color_to_depth(data[:, 0], data[:, 1], depth_img, color_ins)
+    #data[:, 0] = (data[:, 0] / 1080) * 424
+    #data[:, 1] = (data[:, 1] / 1920) * 512
+    
+    return data
+
+def img_pose_skeleton_overlay(img, data, show_numbers=False, anonimyze=False, skeleton_type='openpose'):
+    """
+    overlays pose from json file on the given image
+    Parameters
+    ----------
+    img : rgb image
+    json_path : path to .json file
+
+    Returns
+    -------
+    img : rgb img with pose overlay
+    """
+
+    j2d = data
+
+    if skeleton_type == 'openpose':
+        skeleton_pairs = get_body25_connectivity()
+        #skeleton_pairs = skeleton_pairs[0:19]
+        skeleton_pairs = skeleton_pairs[0:17]
+    else:
+        skeleton_pairs = get_ikea_connectivity()
+    part_colors = get_pose_colors(mode='bgr')
+
+    if anonimyze:
+        # anonimize the img by plotting a black circle centered on the nose
+        nose = tuple(int(element) for element in j2d[0])
+        radius = 45
+        img = cv2.circle(img, nose, radius, (0, 0, 0), -1)
+
+    # plot the joints
+    bad_points_idx = []
+    for i, point in enumerate(j2d):
+        if not point[0] == 0 and not point[1] == 0:
+            cv2.circle(img, (int(point[0]), int(point[1])), 2, (0, 255, 255), thickness=-1, lineType=cv2.FILLED)
+        else:
+            bad_points_idx.append(i)
+
+    # plot the skeleton
+    for i, pair in enumerate(skeleton_pairs):
+        partA = pair[0]
+        partB = pair[1]
+        if partA not in bad_points_idx and partB not in bad_points_idx:
+            # if j2d[partA] and j2d[partB]:
+            line_color = part_colors[i]
+            img = cv2.line(img, tuple([int(el) for el in j2d[partA]]), tuple([int(el) for el in j2d[partB]]), line_color, 2)
+    if show_numbers:
+        # add numbers to the joints
+        for i, point in enumerate(j2d):
+            if i not in bad_points_idx:
+                cv2.putText(img, "{}".format(i), (int(point[0]), int(point[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.3,
+                            (0, 0, 255), 1,
+                            lineType=cv2.LINE_AA)
+
+
+    return img
+
+def get_ikea_connectivity():
+    return [
+        [0, 1],
+        [0, 2],
+        [1, 3],
+        [2, 4],
+        [0, 5],
+        [0, 6],
+        [5, 6],
+        [5, 7],
+        [6, 8],
+        [7, 9],
+        [8, 10],
+        [5, 11],
+        [6, 12],
+        [11, 12],
+        [11, 13],
+        [12, 14],
+        [13, 15],
+        [14, 16]
+    ]
+
+def get_body25_connectivity():
+    """return [
+        [0, 1],
+        [1, 2],
+        [2, 3],
+        [3, 4],
+        [1, 5],
+        [5, 6],
+        [6, 7],
+        [1, 8],
+        [8, 9],
+        [9, 10],
+        [10, 11],
+        [8, 12],
+        [12, 13],
+        [13, 14],
+        [0, 15],
+        [0, 16],
+        [15, 17],
+        [16, 18],
+        [2, 9],
+        [5, 12],
+        [11, 22],
+        [11, 23],
+        [11, 24],
+        [14, 19],
+        [14, 20],
+        [14, 21],
+    ]"""
+    return [
+        [0, 1],
+        [1, 2],
+        [2, 3],
+        [3, 4],
+        [1, 5],
+        [5, 6],
+        [6, 7],
+        [1, 9],
+        [9, 10],
+        [10, 11],
+        [1, 12],
+        [12, 13],
+        [13, 14],
+        [0, 15],
+        [0, 16],
+        [15, 17],
+        [16, 18],
+        [2, 9],
+        [5, 12],
+        [11, 22],
+        [11, 23],
+        [11, 24],
+        [14, 19],
+        [14, 20],
+        [14, 21],
+    ]
+
+def get_pose_colors(mode='rgb'):
+    """
+
+    Parameters
+    ----------
+    mode : rgb | bgr color format to return
+
+    Returns
+    -------
+    list of part colors for skeleton visualization
+    """
+    # colormap from OpenPose: https://github.com/CMU-Perceptual-Computing-Lab/openpose/blob/3c9441ae62197b478b15c551e81c748ac6479561/include/openpose/pose/poseParametersRender.hpp
+    colors = np.array(
+        [
+            [255., 0., 85.],
+            #[255., 0., 0.],
+            [255., 85., 0.],
+            [255., 170., 0.],
+            [255., 255., 0.],
+            [170., 255., 0.],
+            [85., 255., 0.],
+            [0., 255., 0.],
+            [255., 0., 0.],
+            [0., 255., 85.],
+            [0., 255., 170.],
+            [0., 255., 255.],
+            [0., 170., 255.],
+            [0., 85., 255.],
+            [0., 0., 255.],
+            [255., 0., 170.],
+            [170., 0., 255.],
+            [255., 0., 255.],
+            [85., 0., 255.],
+
+            [0., 0., 255.],
+            [0., 0., 255.],
+            [0., 0., 255.],
+            [0., 255., 255.],
+            [0., 255., 255.],
+            [0., 255., 255.]])
+    if mode == 'rgb':
+        return colors
+    elif mode == 'bgr':
+        colors[:, [0, 2]] = colors[:, [2, 0]]
+        return colors
+    else:
+        raise ValueError('Invalid color mode, please specify rgb or bgr')
+
+def find_closest_pair_for_multiple_targets(array, target_values):
+    # 3次元配列のサイズを取得
+    height, width, channels = array.shape
+    
+    target_values_copy = np.copy(target_values)
+    j = 0
+
+    # 各ターゲットに対する最も近い組と距離を保存するリスト
+    closest_pairs = []
+    min_distances = []
+
+    # 各ターゲットに対して計算
+    for target_value in target_values:
+        # 最初の値を初期化
+        closest_pair = (0, 0)
+        min_distance = np.linalg.norm(array[0, 0] - target_value)
+
+        # すべての組み合わせに対してユークリッド距離を計算
+        for y in range(height):
+            for x in range(width):
+                distance = np.linalg.norm(array[y, -x] - target_value)
+                if distance < min_distance:
+                    min_distance = distance
+                    closest_pair = (x, y)
+
+        # 結果を保存
+        closest_pairs.append(closest_pair)
+        min_distances.append(min_distance)
+
+        # target_valueをclosest_pairで置き換える
+        target_values_copy[j] = closest_pair
+        j += 1
+
+    return closest_pairs, min_distances, target_values_copy
+
+
+def ArmHand(Ex, Ey, Wx, Wy):
+    #lx, ly = abs(Wx - Ex), abs(Wy - Ey)
+    lx, ly = Wx - Ex, Wy - Ey
+    ln = math.sqrt(lx * lx + ly * ly)
+    #lnx, lny = lx / ln, ly / ln
+    #wnx, wny = lny, -lnx
+    #wn = Wtol * ln
+    #wx, wy = wn * wnx, wn * wny
+    Hx, Hy = Wx + Htol * lx, Wy + Htol * ly
+    #return lx, ly, wx, wy, Hx, Hy
+    return Hx, Hy
+
+
+#==================================================================
+
+#腕、手の領域決めるための定数
+Wtol = 0.25
+Htol = 0.25
+HRtol = 0.50
+
+#深度カメラのパラメータをdepth_ins_paramsに格納
 depth_ins_params = get_depth_ins_params('DepthIns.txt')
+#RGBカメラのパラメータをrgb_ins_paramsに格納
 rgb_ins_params = get_rgb_ins_params('ColorIns.txt')
 
-# 動画ファイルを開く
+#RGB videoから最初のフレームを読み込む
 cap_c = cv2.VideoCapture('scan_video.avi')
-cap_d = cv2.VideoCapture('scan_video_depth.avi')
-# 最初のフレームを読み込む
-ret, frame1_d = cap_d.read(cv2.IMREAD_ANYDEPTH)
-frame1_d = frame1_d.astype(np.float32)
-if not ret:
-    print("Failed to read the depth video.")
-
-ret, frame1_c = cap_c.read()
+ret, rgb_img = cap_c.read()
 if not ret:
     print("Failed to read the RGB video.")
 
-point_cloud_1 = []
-new_vertices_1 = []
-registered = np.zeros([424, 512, 3], dtype=np.uint8)
-undistorted = np.zeros([424, 512, 3], dtype=np.float32)
+frame_number = 0
 
-for y in range(424):
-    for x in range(512):
-        mx, my = distort(x, y, depth_ins_params)
-        # distortで歪み補正したmx, myを整数値にする
-        ix = int(mx + 0.5)
-        iy = int(my + 0.5)
-        
-        point = getPointXYZ(frame1_d, y, x, depth_ins_params)
-        
-        if (ix >= 0 and ix < 512 and iy >= 0 and iy < 424):  # 指定ピクセルが画像内の場合
-                undistorted[iy, ix] = frame1_d[y, x]
-                z = frame1_d[y, x]
-                if (z > 0).all and not np.isnan(z).all:
-                    cx, cy = depth_to_color(x, y, z, depth_ins_params, rgb_ins_params)
-                    cx, cy = int(cx[0]), int(cy[0])
-                    if (cx >= 0 and cx < 1920 and cy >= 0 and cy < 1080):
-                        registered[y, x, :] = frame1_c[cy, cx].flatten()
-                        registered[y, x, :] = cv2.cvtColor(registered[y, x].reshape([1, 1, 3]),cv2.COLOR_BGR2RGB)
-                        # [x, y, z, r, g, b]形式で各ピクセルの情報を格納
-                        point_cloud_1.append([(point), registered[y, x, :]])
-                        new_vertices_1.append((point[0], point[1], point[2], registered[y, x, 0], registered[y, x, 1], registered[y, x, 2]))
-
-print('Depth&RGB対応完了')
+#depthフォルダから最初のimgを持ってくる
+i = 0
+depth_img = read_depth_image(i)
 
 
+number = str(i).zfill(3)  # 3桁にゼロ埋め
+json_path = f'/Users/uchimurataichi/SceneFlow/openpose_json/scan_video_000000000{number}_keypoints.json'
+data = read_pose_json(json_path, depth_img, rgb_ins_params)
+data2 = data
+#print(data[0])
+"""
+rgb_img = img_pose_skeleton_overlay(rgb_img, data, show_numbers=False, anonimyze=False, skeleton_type='openpose')
+#cv2.imwrite('saved_image2.jpg', rgb_img)
+#cv2.imshow('Pose Overlay', pose_img)
+#cv2.waitKey(0)
+#cv2.destroyAllWindows()
+#"""
 
-# 前のフレームと同じサイズのゼロ行列を作成
-prvs = cv2.cvtColor(frame1_c, cv2.COLOR_BGR2GRAY) #読み込んだフレームをグレースケール化。グレースケールグレースケール画像の方が計算が楽。
-hsv = np.zeros_like(frame1_c)
-hsv[..., 1] = 255
+# 保存するフレームのディレクトリを指定
+output_directory = 'SceneFlow_oak_floor'
+#os.makedirs(output_directory, exist_ok=True)
 
-vectors = []
-fig = plt.figure()
-ax = fig.add_subplot(111, projection='3d')
+hcsize, wcsize = rgb_img.shape[:2]
+hdsize, wdsize = depth_img.shape[:2]
+
+window_size = 3
+
+vertices = np.zeros((hdsize, wdsize, 1))
+
+# 画像データの構造を用意
+image = np.zeros((hdsize, wdsize, 3), dtype=np.uint8)  # 3チャンネルのRGB画像
+
+c_img = np.zeros((hdsize, wdsize, 2))
+loss = np.zeros((hdsize, wdsize, 1)) #画素抜けしてるピクセルの座標を保存
+
+count = 0
+
+while count < 3:
+    count += 1
+    for y in range(1, 423):
+        for x in range(1, 511):
+          if(depth_img[y, x] == 0):
+              roi = depth_img[y - window_size // 2:y + window_size // 2 + 1, x - window_size // 2:x + window_size // 2 + 1]
+              if roi.size > 0:
+                max_value = np.max(roi)
+              else:
+                max_value = 0
+              depth_img[y,x] = max_value
+
+
+rgb_img = cv2.flip(rgb_img, 1)
+depth_img = cv2.flip(depth_img, 1)
+
+for y in range(hdsize):
+    for x in range(wdsize):
+        #distortの出力を整数値にしたのでこのままでOK
+        ix, iy = distort(x, y, depth_ins_params)
+        #point = getPointXYZ(depth_img, y, x, depth_ins_params)
+        #歪み補正した2D座標が画像座標上にあるなら
+        if (ix >= 0 and ix < wdsize and iy >= 0 and iy < hdsize): #wdsize = 512, hdsize = 424
+          z = depth_img[iy, ix]
+          point = getPointXYZ(z, y, x, depth_ins_params)
+          #zが０以外の数なら
+          if z > 0 and not np.isnan(z):
+            cx, cy = depth_to_color(x, y, z, depth_ins_params, rgb_ins_params)
+            
+            c_img[y, -x, 0] = cx
+            c_img[y, -x, 1] = cy
+            
+            if (cx >= 0 and cx < wcsize and cy >= 0 and cy < hcsize): #wcsize = 1920, hcsize = 1080
+              #ここの処理で画素に色が入る
+              
+              cb, cg, cr = rgb_img[cy, cx].flatten()
+              #registered[y, x, :] = (cr, cg, cb)
+              #new_vertices.append((-point[0], -point[1], -point[2], cr, cg, cb))
+              vertices[y, -x, 0] = z
+              image[y, -x, 0] = cr  # 赤成分
+              image[y, -x, 1] = cg  # 緑成分
+              image[y, -x, 2] = cb  # 青成分
+
+image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) #cv2ではBGRで表示されるため
+
+# 各ターゲットに対して最も近い組を求める
+closest_pairs, min_distances, data2= find_closest_pair_for_multiple_targets(c_img, data2)
+
+
+"""
+for target_value, closest_pair, min_distance in zip(data2, closest_pairs, min_distances):
+    print(f"For target {target_value}, closest pair: {closest_pair}, Distance: {min_distance}")
+"""
+
+create_img = img_pose_skeleton_overlay(image_rgb, data2, show_numbers=False, anonimyze=False, skeleton_type='openpose')
+
+REx, REy = data2[3]
+RWx, RWy = data2[4]
+LEx, LEy = data2[6]
+LWx, LWy = data2[7]
+Hx, Hy = ArmHand(REx, REy, RWx, RWy)
+Hp = (int(Hx), int(Hy))
+cv2.circle(create_img, Hp, 1, (255, 255, 255), thickness=1, lineType=cv2.LINE_AA)
+Hx, Hy = ArmHand(LEx, LEy, LWx, LWy)
+Hp = (int(Hx), int(Hy))
+cv2.circle(create_img, Hp, 1, (255, 255, 255), thickness=1, lineType=cv2.LINE_AA)
+
+cv2.imshow('Pose Overlay', create_img)
+cv2.waitKey(0)
+cv2.destroyAllWindows()
+
+
+"""
+json_path = f'/Users/uchimurataichi/SceneFlow/openpose_json/scan_video_000000000000_keypoints.json'
+data = read_pose_json(json_path, depth_img, rgb_ins_params)
+pose_img = img_pose_skeleton_overlay(image_rgb, data, show_numbers=False, anonimyze=False, skeleton_type='openpose')
+#cv2.imwrite('saved_image2.jpg', pose_img)
+cv2.imshow('Pose Overlay', pose_img)
+cv2.waitKey(0)
+cv2.destroyAllWindows()
+#"""
+
 
 while True:
-    
     # 次のフレームを読み込む
-    ret, frame2_c = cap_c.read()
+    ret, rgb_img2 = cap_c.read()
     if not ret:
+        print("Failed to read the RGB video.")
         break
     
-    ret, frame2_d = cap_d.read(cv2.IMREAD_ANYDEPTH)
-    frame2_d = frame2_d.astype(np.float32)
-    if not ret:
-        break
+    #depthフォルダから次のimgを持ってくる
+    i += 1
+    depth_img2 = read_depth_image(i)
     
-    
-    point_cloud_2 = []
-    new_vertices_2 = []
-    registered_2 = np.zeros([424, 512, 3], dtype=np.uint8)
-    undistorted_2 = np.zeros([424, 512, 3], dtype=np.float32)
+    count = 0
 
-    for Y in range(424):
-        for X in range(512):
-            mX, mY = distort(X, Y, depth_ins_params)
-            # distortで歪み補正したmx, myを整数値にする
-            iX = int(mX + 0.5)
-            iY = int(mY + 0.5)
-            
-            point = getPointXYZ(frame2_d, Y, X, depth_ins_params)
-            pre_point = getPointXYZ(frame1_d, Y, X, depth_ins_params)
-            
-            if (iX >= 0 and iX < 512 and iY >= 0 and iY < 424):  # 指定ピクセルが画像内の場合
-                    undistorted_2[iY, iX] = frame2_d[Y, X]
-                    Z = frame2_d[Y, X]
-                    if (Z > 0).all and not np.isnan(Z).all:
-                        cX, cY = depth_to_color(X, Y, Z, depth_ins_params, rgb_ins_params)
-                        if (cX >= 0 and cX < 1920 and cY >= 0 and cY < 1080):
-                            registered_2[Y, X, :] = frame2_c[cY, cX].flatten()
-                            registered_2[Y, X, :] = cv2.cvtColor(registered_2[Y, X].reshape([1, 1, 3]),cv2.COLOR_BGR2RGB)
-                            # [x, y, z, r, g, b]形式で各ピクセルの情報を格納
-                            point_cloud_2.append([(point), registered_2[Y, X, :]])
-                            new_vertices_2.append((point[0], point[1], point[2], registered_2[Y, X, 0], registered_2[Y, X, 1], registered_2[Y, X, 2]))
-                            
-                            
-                            # 3D座標の点とベクトルを定義
-                            plot_point = (point_cloud_2[0], point_cloud_2[1], point_cloud_2[2])
-                            vector = (point[0] - pre_point[0], point[1] - pre_point[1], point[2] - pre_point[2])
-                            
-                            # 点をプロット
-                            ax.scatter(*plot_point, color=(point_cloud_2[4], point_cloud_2[5], point_cloud_2[6]))
-                            ax.quiver(*plot_point, *vector, color='blue')
-                            
-                            print("処理できてる")
-                            
+    while count < 3:
+        count += 1
+        for y in range(1, 423):
+            for x in range(1, 511):
+              if(depth_img2[y, x] == 0):
+                  roi = depth_img2[y - window_size // 2:y + window_size // 2 + 1, x - window_size // 2:x + window_size // 2 + 1]
+                  if roi.size > 0:
+                    max_value = np.max(roi)
+                  else:
+                    max_value = 0
+                  depth_img2[y,x] = max_value
+    
+    rgb_img2 = cv2.flip(rgb_img2, 1)
+    depth_img2 = cv2.flip(depth_img2, 1)
+    
+    new_vertices = np.zeros((hdsize, wdsize, 1))
+    #registered = np.zeros([hdsize, wdsize, 3], dtype=np.uint8)
+    
+    flow = np.zeros((hdsize, wdsize, 2))
+    
+    next_image = np.zeros((hdsize, wdsize, 3), dtype=np.uint8)  # 3チャンネルのRGB画像
+    
+    for y in range(hdsize):
+        for x in range(wdsize):
+            #distortの出力を整数値にしたのでこのままでOK
+            ix, iy = distort(x, y, depth_ins_params)
+            #歪み補正した2D座標が画像座標上にあるなら
+            if (ix >= 0 and ix < wdsize and iy >= 0 and iy < hdsize): #wdsize = 512, hdsize = 424
+              z = depth_img2[iy, ix]
+              point = getPointXYZ(z, y, x, depth_ins_params)
+              #zが０以外の数なら
+              if z > 0 and not np.isnan(z):
+                cx, cy = depth_to_color(x, y, z, depth_ins_params, rgb_ins_params)
+                if (cx >= 0 and cx < wcsize and cy >= 0 and cy < hcsize): #wcsize = 1920, hcsize = 1080
+                  cb, cg, cr = rgb_img2[cy, cx].flatten()
+                  #registered[y, x, :] = (cr, cg, cb)
+                  #new_vertices.append((-point[0], -point[1], -point[2], cr, cg, cb))
+                  new_vertices[y, -x, 0] = z
+                  next_image[y, -x, 0] = cr  # 赤成分
+                  next_image[y, -x, 1] = cg  # 緑成分
+                  next_image[y, -x, 2] = cb  # 青成分
+    
+    
+    #next_image = interpolate_missing_pixels(next_image)
+    next_image_rgb = cv2.cvtColor(next_image, cv2.COLOR_BGR2RGB)
+    
+    
     
 
     
+    """
     # グレースケールに変換
-    next = cv2.cvtColor(frame2_c, cv2.COLOR_BGR2GRAY)
-
+    gray1 = cv2.cvtColor(image_rgb, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(next_image_rgb, cv2.COLOR_BGR2GRAY)
+    
     # Optical Flowを計算
-    flow = cv2.calcOpticalFlowFarneback(prvs, next, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-
-    # オプティカルフローフィールドを表示
-    mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-    hsv[..., 0] = ang * 180 / np.pi / 2
-    hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
-    bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    flow = cv2.calcOpticalFlowFarneback(gray1, gray2, None, 0.5, 3, 15, 3, 5, 1.2, 0)
     
     
-    cv2.imshow('Scene Flow', bgr)
+    for y in range(0, 424, 5):
+        for x in range(0, 512, 5):
+            z = depth_img[y, x]
+            if(x==0 and y==0):
+                x_v, y_v, z_v, u_v, v_v, w_v, x_v2, y_v2, z_v2 = flow_vector1(flow, x, y, z, depth_img2)
+                #print(f"x_v={x_v}, y_v={y_v}, z_v={z_v}, u_v={u_v}, v_v={v_v}, w_v={w_v}")
+            else:
+                #print(f"x_v={x_v}, y_v={y_v}, z_v={z_v}, u_v={u_v}, v_v={v_v}, w_v={w_v}")
+                x_v, y_v, z_v, u_v, v_v, w_v, x_v2, y_v2, z_v2 = flow_vector2(flow, x, y, z, depth_img2, x_v, y_v, z_v, u_v, v_v, w_v, x_v2, y_v2, z_v2)
+                
     
+    # 各ベクトルを抽出
+    #x, y, z, u, v, w = arrange[:, 0], arrange[:, 1], arrange[:, 2], arrange[:, 3], arrange[:, 4], arrange[:, 5]
     
-    ax.set_xlabel('X軸')
-    ax.set_ylabel('Y軸')
-    ax.set_zlabel('Z軸')
-    ax.legend()
+    # 3Dプロットを作成
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+    
+    lw = 1.0
+    l = 0.25
+    alr = 0.1
+    
+    # ベクトルをプロット
+    #ax.quiver(x_v, y_v, z_v, u_v, v_v, w_v, normalize=True)
+    #ax.quiver(x_v, y_v, z_v, u_v, v_v, w_v, normalize=True, color=[0.0, 1.0, 0.0])
+    #ax.quiver(x_v, z_v, y_v, u_v, w_v, v_v, linewidth=lw, length=l, arrow_length_ratio=alr)
+    #ax.quiver(x_v, z_v, y_v, u_v, w_v, v_v, normalize=True, color=[0.0, 1.0, 0.0])
+    
+    colors = [(next_image[int(y), int(-x), :] / 255) for x, y in zip(x_v, y_v)]
+    #ax.scatter(x_v, z_v, y_v, c=[next_image[y_v, x_v, 0], next_image[y_v, x_v, 1], next_image[y_v, x_v, 2]], marker='o')
+    ax.scatter(x_v2, z_v2, y_v2, c=colors, marker='o', s=1)
+    ax.quiver(x_v2, z_v2, y_v2, u_v, w_v, v_v, linewidth=lw, length=l, arrow_length_ratio=alr, color=[0.0, 1.0, 0.0])
+    
+    #max_value = max(z_v)
+    #print("最大値:", max_value)
+    
+    # ラベルの設定
+    ax.set_xlabel('X')
+    ax.set_ylabel('Z')
+    ax.set_zlabel('Y')
+    
+    # 値域を設定
+    ax.set_xlim(max(x_v2), min(x_v2))
+    ax.set_ylim(0, 4500)
+    ax.set_zlim(max(y_v2), min(y_v2))
+    
     plt.show()
+    #plt.savefig(f'/Users/uchimurataichi/SceneFlow/SceneFlow_oak_floor/000{i}.png')
+    #"""
+
+    print("現在のフレーム:", frame_number)
     
+    # 次のフレームの処理に進む
+    frame_number += 1
+    
+    depth_img = depth_img2.copy()
+    image_rgb = next_image_rgb.copy()
+    vertices = new_vertices.copy()
 
-    # 'q'キーを押したらループから抜ける
-    if cv2.waitKey(10) & 0xFF == ord('q'):
-        break
-
-    # 現在のフレームを前のフレームに設定
-    prvs = next
-    frame1_c = frame2_c
-    frame1_d = frame2_d
-    point_cloud_1 = []
-    new_vertices_1 = []
-    point_cloud_1 = [(point[0], point[1], point[2], point[3], point[4], point[5]) for point in point_cloud_2]
-    new_vertices_1 = [(point[0], point[1], point[2], point[3], point[4], point[5]) for point in new_vertices_2]
-
-# ウィンドウを閉じる
-cap_c.release()
-cap_d.release()
+"""
+# 画像を表示
+cv2.imshow('Generated Image', image_rgb)
+cv2.waitKey(0)
 cv2.destroyAllWindows()
+#"""
+cap_c.release()
